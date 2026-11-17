@@ -35,12 +35,22 @@ functions, a large one through `mcp_find`/`mcp_call`. Long conversations are
 compacted before they overflow: older tool results are truncated first, then
 older turns are replaced by the model's own notes; the truncate-on-400
 recovery of the base samples remains as a fallback.
+
+The hard constraints also live in a constraint ledger (`Ledger` below):
+the planner seeds it from a machine-readable block at the end of its plan,
+the worker records evidence into it with the `ledger_update` tool as it
+verifies each constraint, and the verifier reports every entry as verified,
+failed, or unverified. The ledger is kept outside every conversation —
+mirrored to a file in this server's own scratch space — and is re-attached
+verbatim whenever a conversation is compacted, so a constraint stated at
+the start of a long task cannot be lost to summarization.
 """
 
 import asyncio
 import json
 import os
 import re
+import tempfile
 
 import openai
 import taskbridge
@@ -116,7 +126,10 @@ method to use, and how to check it. The plan must also have a section titled "Ha
 requirement the task states as mandatory — exact deliverable paths and formats, numeric limits, required contents, \
 anything stated with "must", "shall", "at least", "at most" or "exactly" — each quoted or closely paraphrased, with \
 how it will be verified. If the task states no hard constraints beyond the deliverables themselves, say so in that \
-section."""
+section. End the plan with a fenced block whose info string is "ledger", holding a JSON array with one object per \
+hard constraint, with keys "id" ("C1", "C2", ...), "requirement", "source" (where the constraint is stated: the \
+file, page, section or cell), "threshold", "unit", and "verification" (how it will be checked against the \
+deliverables). Use an empty array when there are none."""
 
 WORKER = """You are an expert engineer working on a task in a Linux container with no internet access. Your tools \
 act inside it, and bash starts in {workdir}. A plan for the task follows it; use it, and correct it where the files \
@@ -128,15 +141,23 @@ anything else — a deliverable that misses one is largely wasted work, however 
 not by hand. Write each deliverable exactly where and in the format the task asks, then open it again to check it. \
 Before you finish, re-read the task and go through the hard constraints one by one, verifying each against the \
 actual files (recompute the numbers, reopen the files), and fix anything that fails. When you are done, reply \
-without calling a tool: a short summary of each deliverable, where it is, and the key results."""
+without calling a tool: a short summary of each deliverable, where it is, and the key results.
+
+The plan is followed by a constraint ledger: the same hard constraints as structured entries with ids. The ledger \
+is kept outside this conversation and is re-attached verbatim whenever the conversation is compacted, so it is \
+always current. When you have verified a constraint against the actual files, call ledger_update with its id and \
+the evidence: the file, the line or cell, and the observed value. If you discover a hard constraint the plan \
+missed, create its entry the same way, with its requirement, source, threshold, unit and verification method."""
 
 VERIFIER = """You check an engineer's work on a task in a Linux container. You get the task, the plan, and the \
 engineer's summary of what was delivered. Open every deliverable with your tools (bash starts in {workdir}) and \
 check it against the task.{mcp} Check the plan's "Hard constraints" first, one by one: each exact path, format, \
 numeric limit and required content, recomputed from the files. Then check the rest: every part the task asks for, \
-and the key numbers. Do not create or change any file. If everything holds, reply with the single word PASS and \
-nothing else. Otherwise reply with a numbered list of the gaps, each specific enough to fix, hard-constraint \
-failures first."""
+and the key numbers. Do not create or change any file. If a constraint ledger follows the summary, report every \
+entry on its own line, before your other findings: `LEDGER C1: VERIFIED — <the evidence you checked>`, \
+`LEDGER C1: FAILED — <what is wrong>`, or `LEDGER C1: UNVERIFIED — <why it could not be checked>`. An entry you \
+do not report counts as unverified. If everything holds, reply with the single word PASS and nothing else. \
+Otherwise reply with a numbered list of the gaps, each specific enough to fix, hard-constraint failures first."""
 
 MCP_DIRECT = """
 
@@ -152,7 +173,8 @@ mcp_call to run it.
 SUMMARY_PROMPT = """The conversation is getting long, so the earlier turns will be removed. Write notes that let \
 you continue without them: what the task requires (including every hard constraint), what you found in the files, \
 every file you created or changed (with its path and state), the numbers and decisions so far, and what remains to \
-do. Be specific."""
+do. Be specific. A separate constraint ledger is kept outside this conversation and re-attached verbatim after \
+compaction, so do not spend the notes on repeating it."""
 
 
 def tool(name, description, **params):
@@ -226,6 +248,34 @@ MCP_CALL = {
                 "arguments": {"type": "object"},
             },
             "required": ["tool", "arguments"],
+        },
+    },
+}
+LEDGER_UPDATE = {
+    "type": "function",
+    "function": {
+        "name": "ledger_update",
+        "description": (
+            "Record evidence for a hard constraint in the constraint"
+            " ledger, which is kept outside this conversation and"
+            " survives compaction. Give the constraint id and the"
+            " evidence: the deliverable file, the line or cell, and the"
+            " observed value. To create an entry for a hard constraint"
+            " the plan missed, also give its requirement, source,"
+            " threshold, unit and verification method."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "evidence": {"type": "string"},
+                "requirement": {"type": "string"},
+                "source": {"type": "string"},
+                "threshold": {"type": "string"},
+                "unit": {"type": "string"},
+                "verification": {"type": "string"},
+            },
+            "required": ["id"],
         },
     },
 }
@@ -499,7 +549,205 @@ class MCP:
     return clip(await server.call(t["name"], arguments))
 
 
-async def run_tool(session, mcp, fn, allowed):
+LEDGER_FENCE = re.compile(r"```ledger\s*\n(.*?)```", re.S)
+LEDGER_LINE = re.compile(
+    r"^\s*(?:[-*]\s*)?LEDGER\s+([A-Za-z][A-Za-z0-9_-]*)\s*:\s*"
+    r"(VERIFIED|FAILED|UNVERIFIED)\b\s*[—–-]?\s*(.*)$",
+    re.I | re.M,
+)
+LEDGER_FIELDS = ("requirement", "source", "threshold", "unit", "verification")
+
+
+class Ledger:
+  """The task's hard constraints, kept outside every conversation.
+
+  The planner seeds the ledger from the machine-readable block at the end
+  of its plan; the worker records evidence with the `ledger_update` tool;
+  the verifier's per-entry verdicts are parsed back into it. The ledger
+  lives in this process, mirrored to a JSON file in the server's own
+  scratch space (never in the task container, so it cannot be mistaken
+  for a deliverable), and compaction — which only rewrites conversation
+  messages — cannot lose an entry: `compact` re-attaches
+  `preserved_block()` verbatim after the notes.
+  """
+
+  def __init__(self, session):
+    self.entries = {}  # id -> entry dict, in seeding order
+    name = re.sub(
+        r"[^A-Za-z0-9_-]", "_", str(session.task.get("session") or "task")
+    )[:40]
+    self.path = os.path.join(
+        tempfile.gettempdir(), f"ple-ledger-{name}.json"
+    )
+
+  def __len__(self):
+    return len(self.entries)
+
+  def seed(self, plan):
+    """Parses the planner's ```ledger block into entries.
+
+    Args:
+      plan: The planner's reply text.
+
+    Returns:
+      The number of entries in the ledger (0 when the block is absent or
+      invalid; the prose "Hard constraints" section still flows to the
+      worker in that case).
+    """
+    match = LEDGER_FENCE.search(plan or "")
+    if not match:
+      return 0
+    try:
+      items = json.loads(match.group(1))
+    except ValueError:
+      return 0
+    if not isinstance(items, list):
+      return 0
+    for item in items:
+      if not isinstance(item, dict):
+        continue
+      cid = str(item.get("id") or "").strip().upper()
+      if not cid:
+        cid = f"C{len(self.entries) + 1}"
+      base, n = cid, 1
+      while cid in self.entries:
+        n += 1
+        cid = f"{base}_{n}"
+      entry = {"id": cid, "evidence": "", "status": "open", "note": ""}
+      for field in LEDGER_FIELDS:
+        entry[field] = str(item.get(field) or "")
+      self.entries[cid] = entry
+    self.save()
+    return len(self.entries)
+
+  def save(self):
+    """Mirrors the ledger to its scratch file (best effort, never fatal)."""
+    try:
+      with open(self.path, "w") as fh:
+        json.dump(list(self.entries.values()), fh, indent=1)
+    except OSError:
+      pass
+
+  def update(self, args):
+    """Applies a `ledger_update` call and returns its result text.
+
+    Creates the entry when the id is new (a hard constraint the plan
+    missed). New evidence supersedes an earlier verdict until the
+    verifier checks the constraint again.
+
+    Args:
+      args: The tool call's arguments dictionary.
+
+    Returns:
+      A one-line confirmation naming the entry's state, or an error
+      string when the call names no constraint.
+    """
+    cid = str(args.get("id") or "").strip().upper()
+    if not cid:
+      return "error: ledger_update needs the constraint id"
+    entry = self.entries.get(cid)
+    if entry is None:
+      entry = {"id": cid, "evidence": "", "status": "open", "note": ""}
+      self.entries[cid] = entry
+    for field in LEDGER_FIELDS:
+      if args.get(field):
+        entry[field] = str(args[field])
+    if args.get("evidence"):
+      entry["evidence"] = str(args["evidence"])
+      entry["status"] = "evidenced"
+      entry["note"] = ""
+    self.save()
+    return f"ledger {cid} recorded: {self._line(entry)}"
+
+  def _line(self, entry):
+    """Formats one entry as a single ledger line."""
+    limit = " ".join(p for p in (entry["threshold"], entry["unit"]) if p)
+    return (
+        f"{entry['id']} | limit: {limit or '—'}"
+        f" | {entry['requirement'] or '—'}"
+        f" | source: {entry['source'] or '—'}"
+        f" | verify: {entry['verification'] or '—'}"
+        f" | evidence: {entry['evidence'] or '(none yet)'}"
+        f" | status: {entry['status']}"
+    )
+
+  def render(self):
+    """Returns the ledger as one line per entry, for prompts."""
+    return "\n".join(self._line(e) for e in self.entries.values())
+
+  def preserved_block(self):
+    """Returns the message re-attached verbatim after a compaction.
+
+    Empty when the ledger has no entries, so a conversation for a task
+    without hard constraints compacts exactly as before.
+    """
+    if not self.entries:
+      return ""
+    return (
+        "## Constraint ledger (preserved verbatim across compaction)\n\n"
+        + self.render()
+        + "\n\nThis ledger is kept outside the summarized history and is"
+        " always current. Keep satisfying every entry, and call"
+        " ledger_update when you verify one."
+    )
+
+  def apply_verdicts(self, verdict):
+    """Parses the verifier's LEDGER lines into entry statuses.
+
+    Args:
+      verdict: The verifier's reply text.
+
+    Returns:
+      (gaps, mentioned): fix-round gap strings for the entries reported
+      FAILED or UNVERIFIED, and the set of entry ids the verifier
+      reported on at all.
+    """
+    gaps, mentioned = [], set()
+    for match in LEDGER_LINE.finditer(verdict or ""):
+      cid = match.group(1).upper()
+      status, note = match.group(2).lower(), match.group(3).strip()
+      entry = self.entries.get(cid)
+      if entry is None:
+        continue
+      mentioned.add(cid)
+      entry["status"] = status
+      entry["note"] = note
+      if status in ("failed", "unverified"):
+        gaps.append(
+            f"Hard constraint {cid} ({entry['requirement']}): {status}"
+            f" — {note or 'no reason given'}"
+        )
+    self.save()
+    return gaps, mentioned
+
+  def strip_lines(self, verdict):
+    """Removes the LEDGER lines from a verifier reply.
+
+    Args:
+      verdict: The verifier's reply text.
+
+    Returns:
+      The reply without its LEDGER verdict lines, so the caller can
+      judge the remaining text (PASS or a gap list) on its own.
+    """
+    return "\n".join(
+        line
+        for line in (verdict or "").splitlines()
+        if not LEDGER_LINE.match(line)
+    )
+
+  def summary_line(self):
+    """Returns a one-line status per entry, for logs and the summary."""
+    parts = []
+    for entry in self.entries.values():
+      part = f"{entry['id']} {entry['status']}"
+      if entry["status"] in ("failed", "unverified") and entry["note"]:
+        part += f" ({entry['note']})"
+      parts.append(part)
+    return "; ".join(parts)
+
+
+async def run_tool(session, mcp, fn, allowed, ledger=None):
   """Executes a single tool call and returns its output.
 
   Rewrites `fn["arguments"]` as canonical JSON (or `"{}"` if invalid) so the
@@ -513,6 +761,9 @@ async def run_tool(session, mcp, fn, allowed):
     mcp: The session's `MCP` registry.
     fn: Function-call dictionary containing `name` and `arguments`.
     allowed: Names of the tools offered to the calling role.
+    ledger: The task's `Ledger`, for the harness-side `ledger_update`
+      tool (which never touches the task container); `None` for roles
+      that were not offered it.
 
   Returns:
     The clipped tool output or error string to send back to the model.
@@ -532,6 +783,10 @@ async def run_tool(session, mcp, fn, allowed):
   if name not in allowed:
     return f"error: the tool {name} is not available in this step"
   try:
+    if name == "ledger_update":
+      if ledger is None:
+        return "error: there is no constraint ledger in this step"
+      return ledger.update(args)
     if name == "bash":
       result = await session.exec(args["command"])
       return clip(f"exit code {result['exit_code']}\n{result['output']}")
@@ -692,7 +947,7 @@ async def complete_once(session, messages):
   return text
 
 
-async def compact(session, messages, force=False):
+async def compact(session, messages, force=False, preserve=""):
   """Shrinks `messages` in place so the next model call fits the context.
 
   First truncates older tool results the model has already read (keeping
@@ -708,6 +963,9 @@ async def compact(session, messages, force=False):
     force: Whether compaction was triggered by a context-full error; then
       all read results are cut and the notes are written whenever the
       estimate is still over the threshold.
+    preserve: Text kept outside the conversation (the constraint
+      ledger's block) that is re-attached verbatim right after the
+      notes, so it survives the replacement word for word.
 
   Returns:
     `True` if any tool results were truncated or turns were summarized.
@@ -750,17 +1008,18 @@ async def compact(session, messages, force=False):
         "context: the notes came back empty, so the turns are kept"
     )
     return bool(cuts)
-  messages[:] = (
-      messages[:2]
-      + [{
-          "role": "user",
-          "content": (
-              "Your notes on the work so far (earlier turns were removed "
-              "to save context):\n" + notes
-          ),
-      }]
-      + messages[cut:]
-  )
+  kept = messages[:2] + [{
+      "role": "user",
+      "content": (
+          "Your notes on the work so far (earlier turns were removed "
+          "to save context):\n" + notes
+      ),
+  }]
+  if preserve:
+    kept.append({"role": "user", "content": preserve})
+  messages[:] = kept + messages[cut:]
+  if preserve:
+    await session.log("context: preserved block re-attached verbatim")
   await session.log(f"context: replaced {cut - 2} messages with notes")
   return True
 
@@ -788,7 +1047,8 @@ def conversation(system, session, mcp_section, prompt):
   ]
 
 
-async def agent(session, mcp, messages, tools, until, final=False):
+async def agent(session, mcp, messages, tools, until, final=False,
+              ledger=None):
   """Runs the tool-calling loop on `messages` until the model answers.
 
   Prompts the model to wrap up immediately once fewer than `until` seconds
@@ -804,6 +1064,8 @@ async def agent(session, mcp, messages, tools, until, final=False):
     until: Remaining task time threshold (in seconds) at which this step
       wraps up.
     final: Whether to record responses in `session.final_message`.
+    ledger: The task's `Ledger` when this role may update it; its block
+      is re-attached verbatim at every compaction.
 
   Returns:
     The final text response produced by this agent step.
@@ -816,7 +1078,11 @@ async def agent(session, mcp, messages, tools, until, final=False):
     left = session.time_left()  # None when the task has no time limit
     wrap_up = left is not None and left < until
     if not wrap_up and prompt_tokens > COMPACT_AT:
-      if await compact(session, messages):
+      if await compact(
+          session,
+          messages,
+          preserve=ledger.preserved_block() if ledger else "",
+      ):
         prompt_tokens = estimate_tokens(messages)
     if wrap_up and messages[-1:] != [WRAP_UP]:  # asked once, also on a retry
       messages.append(dict(WRAP_UP))
@@ -850,7 +1116,12 @@ async def agent(session, mcp, messages, tools, until, final=False):
       if (
           status == 400
           and CONTEXT_FULL.search(str(exc))
-          and await compact(session, messages, force=True)
+          and await compact(
+              session,
+              messages,
+              force=True,
+              preserve=ledger.preserved_block() if ledger else "",
+          )
       ):
         prompt_tokens = estimate_tokens(messages)
         continue
@@ -901,7 +1172,9 @@ async def agent(session, mcp, messages, tools, until, final=False):
       await session.log(
           f"{call['function']['name']} {call['function']['arguments'][:200]}"
       )
-      content = await run_tool(session, mcp, call["function"], allowed)
+      content = await run_tool(
+          session, mcp, call["function"], allowed, ledger
+      )
       messages.append(
           {"role": "tool", "tool_call_id": call["id"], "content": content}
       )
@@ -950,6 +1223,7 @@ async def solve(session):
   mcp = MCP()
   section = await mcp.connect(session)
   task = session.instruction
+  ledger = Ledger(session)
   plan = await agent(
       session,
       mcp,
@@ -958,9 +1232,29 @@ async def solve(session):
       until(1 - PLAN_SHARE),
   )
   await session.log(f"plan: {plan[:1000]}")
-  work = conversation(WORKER, session, section, f"{task}\n\n## Plan\n{plan}")
+  seeded = ledger.seed(plan)
+  await session.log(
+      f"ledger: seeded {seeded} hard constraint(s) from the plan"
+  )
+  worker_tools = mcp.tools(TOOLS)
+  prompt = f"{task}\n\n## Plan\n{plan}"
+  if seeded:
+    worker_tools = worker_tools + [LEDGER_UPDATE]
+    prompt += (
+        "\n\n## Constraint ledger\n"
+        + ledger.render()
+        + "\n\nAs you verify each constraint against the actual files,"
+        " call ledger_update with its id and the evidence."
+    )
+  work = conversation(WORKER, session, section, prompt)
   summary = await agent(
-      session, mcp, work, mcp.tools(TOOLS), until(CHECK_SHARE), final=True
+      session,
+      mcp,
+      work,
+      worker_tools,
+      until(CHECK_SHARE),
+      final=True,
+      ledger=ledger,
   )
   for _ in range(MAX_FIX_ROUNDS):
     if not time_for(until(CHECK_SHARE / 2)):
@@ -969,6 +1263,8 @@ async def solve(session):
         f"## Task\n{task}\n\n## Plan\n{plan}\n\n## The engineer's"
         f" summary\n{summary}"
     )
+    if seeded:
+      review += f"\n\n## Constraint ledger\n{ledger.render()}"
     verdict = await agent(
         session,
         mcp,
@@ -977,27 +1273,60 @@ async def solve(session):
         until(CHECK_SHARE / 2),
     )
     await session.log(f"verifier: {verdict[:1000]}")
-    # PASS alone in any letter case (Markdown emphasis and a full stop aside),
-    # or an empty reply, names no gaps
-    if verdict.strip("*_. \r\n\t").upper() in ("", "PASS") or not time_for(
-        WRAP_UP_SEC
-    ):
+    ledger_gaps = []
+    rest = verdict
+    if seeded:
+      ledger_gaps, mentioned = ledger.apply_verdicts(verdict)
+      rest = ledger.strip_lines(verdict)
+      # PASS alone in any letter case (Markdown emphasis and a full stop
+      # aside), or an empty reply, names no gaps
+      if rest.strip("*_. \r\n\t").upper() in ("", "PASS"):
+        # an entry the verifier never reported on counts as unverified
+        for entry in ledger.entries.values():
+          if entry["id"] not in mentioned and entry["status"] != "verified":
+            entry["status"] = "unverified"
+            entry["note"] = "the reviewer did not report on this constraint"
+            ledger_gaps.append(
+                f"Hard constraint {entry['id']} ({entry['requirement']}):"
+                " unverified — the reviewer did not report on this"
+                " constraint"
+            )
+        ledger.save()
+      await session.log(f"ledger: {ledger.summary_line()}")
+    if (
+        rest.strip("*_. \r\n\t").upper() in ("", "PASS")
+        and not ledger_gaps
+    ) or not time_for(WRAP_UP_SEC):
       break
+    gaps = []
+    if rest.strip("*_. \r\n\t").upper() not in ("", "PASS"):
+      gaps.append(rest.strip())
+    gaps.extend(ledger_gaps)
     work.append({
         "role": "user",
         "content": (
-            "A reviewer checked your files and found these"
-            f" gaps:\n{verdict}\n\nFix them, then reply with your updated"
-            " summary."
+            "A reviewer checked your files and found these gaps:\n"
+            + "\n".join(gaps)
+            + "\n\nFix them, then reply with your updated summary."
         ),
     })
     summary = (
         await agent(
-            session, mcp, work, mcp.tools(TOOLS), WRAP_UP_SEC, final=True
+            session,
+            mcp,
+            work,
+            worker_tools,
+            WRAP_UP_SEC,
+            final=True,
+            ledger=ledger,
         )
         or summary
     )
-  return summary or session.final_message
+  result = summary or session.final_message
+  if seeded and result:
+    result += f"\n\nConstraint ledger: {ledger.summary_line()}."
+    session.final_message = result
+  return result
 
 
 if __name__ == "__main__":

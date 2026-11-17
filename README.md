@@ -41,6 +41,18 @@ Cross-cutting features:
   older turns are replaced by notes the model writes about its own work.
   A context-length 400 triggers the same compaction with `force=True`;
   the base samples' truncate-oldest-half recovery remains as a fallback.
+- **Constraint ledger**: the planner ends its plan with a machine-readable
+  `ledger` block (one entry per hard constraint: id, requirement, source,
+  threshold + unit, verification method). The harness keeps the ledger
+  outside every conversation — mirrored to a JSON file in the server's
+  own scratch space, never in the task container — and re-attaches it
+  verbatim after every compaction, so a constraint stated at the start
+  of a long task cannot be lost to summarization. The worker records
+  evidence into it with the `ledger_update` tool as it verifies each
+  constraint; the verifier reports every entry as `VERIFIED`, `FAILED`,
+  or `UNVERIFIED`, and failed or unreported entries go back to the worker
+  as fix-round gaps. The final message ends with the ledger's status
+  line.
 - **Retries**: transient API failures (429, 5xx, dropped connections) are
   retried with backoff without polluting the conversation; each step's
   in-flight call is stopped at its wrap-up threshold and the model is
@@ -52,7 +64,7 @@ Cross-cutting features:
 
 | File | Purpose |
 |---|---|
-| `serve.py` | Agent loop, roles, MCP integration, and compaction |
+| `serve.py` | Agent loop, roles, MCP integration, compaction, and the constraint ledger |
 | `taskbridge.py` | Serve protocol implementation (shared across Python samples) |
 | `requirements.txt` | Pinned `openai` and `websockets` dependencies |
 | `submission.yaml` | Model declaration, build command, and server startup command |
