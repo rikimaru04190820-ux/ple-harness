@@ -1,47 +1,68 @@
-# minimal: a short tool-calling loop on Gemini 3.8 Flash
+# ple-baseline: plan–work–verify harness with MCP tools and compaction
 
-The smallest complete harness in this repository (under 250 lines of code in
-`serve.py`, built on `taskbridge.py`) and the easiest starting point for a
-custom agent. It calls the Google-sponsored `google-cloud/gemini-3.8-flash`
-model, so it needs no API key.
+A three-role harness built from the `plan-verify` sample, with the MCP
+discovery and context-compaction approaches of `custom-openai` ported in.
+It calls the Google-sponsored `google-cloud/gemini-3.8-flash` model, so it
+needs no API key.
 
 ## How it works
 
-`solve(session)` in `serve.py` implements the entire agent loop:
+`solve(session)` in `serve.py` runs three roles per task, each a separate
+conversation on the same model:
 
-1. Sends a concise system prompt, the task instruction, and three tools (`bash`, `read_file`, and `write_file`).
-2. Executes each tool call inside the task container via `session.exec`,
-   `session.read_file`, or `session.write_file`, and returns the output to the
-   model along with the remaining task time in minutes.
-3. When the model responds without calling a tool, that response becomes
-   `final_message`. If a response is empty or truncated at the token limit, the
-   loop nudges the model to continue (up to `MAX_NUDGES = 3` times) and
-   concatenates truncated replies.
-4. Four minutes before the task deadline (`WRAP_UP_SEC`), any in-flight model call is cancelled and the model is asked for its final summary with `tool_choice="none"`.
-5. Transient API failures (`429`, `5xx`, or dropped connections) are logged and retried with backoff (`RETRY_WAITS`, 5 seconds to 2 minutes, stopping before the wrap-up deadline) without polluting the conversation history. If the endpoint returns a `400` context-length error, the older half of long tool outputs is trimmed to the first 1,000 characters (`CUT_KEEP`) and the call is retried.
+1. **Planner** (read-only tools, first ~10% of the time): inspects the
+   task's files and replies with a plan — each deliverable with its exact
+   path and format, the method, how to check it, and a "Hard constraints"
+   section listing every mandatory requirement in the task.
+2. **Worker** (all tools, until 25% of the time remains): executes the
+   plan. Its prompt makes hard constraints the first priority and requires
+   a final one-by-one re-check of each constraint against the actual files
+   before finishing. Its answer becomes `final_message`.
+3. **Verifier** (read-only tools, fresh conversation with only the task,
+   the plan, and the worker's summary): checks the hard constraints first,
+   then the rest of the deliverables. It replies `PASS` or a list of gaps;
+   gaps go back to the worker for up to 2 fix rounds. Fix rounds wrap up
+   `WRAP_UP_SEC` (240 s) before the deadline, so verification can never
+   consume the time reserved for final deliverables and the summary.
 
-Every non-empty text response updates `session.final_message` so `taskbridge`
-still sends the latest summary if the task is cancelled. Token usage is reported
-after each call via `session.usage`. Assistant messages are appended via
-`model_dump()` so provider-specific fields (like Gemini's thought signatures)
-are preserved across turns.
+Cross-cutting features:
+
+- **MCP tools**: at session start the harness connects to the task's MCP
+  servers (`taskbridge.MCPClient`), discovers their tools, and offers them
+  to the model alongside `bash`/`read_file`/`write_file`. A small catalog
+  (≤ 40,000 chars of JSON) is offered directly as `<server>__<tool>`
+  functions; a larger one is listed in the system prompt and reached
+  through `mcp_find`/`mcp_call`. The planner and verifier only receive
+  tools the server annotates `readOnlyHint`, and tool calls outside a
+  role's offered set are refused.
+- **Compaction**: when a call's prompt size passes `COMPACT_AT_TOKENS`
+  (default 150,000), older tool results the model has already read are
+  truncated (the 12 most recent are kept); if that is not enough, the
+  older turns are replaced by notes the model writes about its own work.
+  A context-length 400 triggers the same compaction with `force=True`;
+  the base samples' truncate-oldest-half recovery remains as a fallback.
+- **Retries**: transient API failures (429, 5xx, dropped connections) are
+  retried with backoff without polluting the conversation; each step's
+  in-flight call is stopped at its wrap-up threshold and the model is
+  asked for its answer with `tool_choice="none"`.
+- Token usage is reported after each call via `session.usage`, including
+  the compaction-notes calls. Assistant messages are appended via
+  `model_dump()` so provider-specific fields (like Gemini's thought
+  signatures) are preserved across turns.
 
 | File | Purpose |
 |---|---|
-| `serve.py` | Agent loop and tool definitions |
+| `serve.py` | Agent loop, roles, MCP integration, and compaction |
 | `taskbridge.py` | Serve protocol implementation (shared across Python samples) |
 | `requirements.txt` | Pinned `openai` and `websockets` dependencies |
 | `submission.yaml` | Model declaration, build command, and server startup command |
 
 ## Customizing
 
-Because the OpenAI SDK reads `OPENAI_BASE_URL` and `OPENAI_API_KEY` (which the evaluator sets for every model), you can switch to any model in [`docs/models.md`](../../docs/models.md) just by changing `model_api` in `submission.yaml`.
+Because the OpenAI SDK reads `OPENAI_BASE_URL` and `OPENAI_API_KEY` (which
+the evaluator sets for every model), you can switch to any sponsored model
+just by changing `model_api` in `submission.yaml`.
 
-- For models with smaller context windows, set a lower `MAX_OUTPUT_TOKENS` (default `32000`) under `env:` in `submission.yaml`.
-- To try it locally without a Google Cloud project for `kit/model_proxy`, set
-  `model_api: gemini/gemini-3.8-flash` and put `GEMINI_API_KEY` in your
-  environment or `--env-file`. That entry runs locally only; submit it with a
-  `google-cloud/<id>` model.
+- For models with smaller context windows, set a lower `MAX_OUTPUT_TOKENS`
+  (default 32000) or `COMPACT_AT_TOKENS` under `env:` in `submission.yaml`.
 - Always generate your `artifacts/` with the same `model_api` you submit.
-
-To keep the code minimal, this starter omits task MCP tools (so `kit check` prints a warning at the `mcp` stage), streaming, and compaction into notes (it only cuts old tool results once the context is full). See [`custom-openai`](../custom-openai/) for a full harness with those features, or [`plan-verify`](../plan-verify/) for a multi-role planner/worker/verifier loop built on `minimal`.
