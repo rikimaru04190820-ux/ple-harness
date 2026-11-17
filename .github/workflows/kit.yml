@@ -1,0 +1,51 @@
+# PLE kit CI: validate the submission and build it the way the server does.
+#
+# Gating steps: `kit validate` (submission.yaml, no Docker) and `kit build`
+# (bundle + serve image, Docker). Both must pass for a commit to be
+# considered submittable-shaped.
+#
+# Model-dependent stages are intentionally NOT run here: `kit check`'s
+# smoke/MCP/cancel stages and the dev-set evaluation need the kit's model
+# proxy (MODEL_PROXY_URL / MODEL_PROXY_KEY) and the gated HF dev set
+# (HF_TOKEN). Those secrets are not configured on this repo yet. Once they
+# are, add a separate non-gating job that runs, from the kit checkout:
+#   python -m kit check <entry> --env-file <file with the proxy settings>
+# Until then, this workflow still proves the entry validates and builds.
+
+name: kit
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  validate-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the entry
+        uses: actions/checkout@v4
+        with:
+          path: entry
+
+      - name: Clone the PLE kit (google-research/ple)
+        run: git clone --depth 1 https://github.com/google-research/ple.git kit-src
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the kit's dependencies in a venv
+        run: |
+          python -m venv .venv-kit
+          .venv-kit/bin/pip install \
+            "pyyaml>=6.0" "websockets>=13.0" "python-dotenv>=1.0" \
+            "huggingface-hub>=1.31,<2"
+
+      - name: kit validate (gating)
+        working-directory: kit-src
+        run: ../.venv-kit/bin/python -m kit validate ../entry
+
+      - name: kit build (gating, Docker)
+        working-directory: kit-src
+        run: ../.venv-kit/bin/python -m kit build ../entry
