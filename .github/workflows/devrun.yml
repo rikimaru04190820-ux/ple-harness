@@ -109,11 +109,11 @@ jobs:
         # websockets is importable before it starts.
         run: uv tool install harbor==0.20.0 --with websockets
 
-      - name: Free disk space (precaution)
-        run: |
-          df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
-          df -h /
+      # NOTE (2026-11-18): the precautionary `rm -rf` of the android/dotnet/
+      # ghc tool dirs stalled run #1 for 40+ minutes and was removed. The
+      # runner reported 87G free, which is ample for one dev task.
+      - name: Report disk space
+        run: df -h /
 
       - name: Generate the in-job proxy key
         # MODEL_PROXY_KEY is the key the kit presents to OUR proxy; it is a
