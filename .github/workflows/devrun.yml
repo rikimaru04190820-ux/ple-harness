@@ -60,6 +60,13 @@ on:
         # weights are not knowable without downloading the dataset, so
         # "lightest" is a judgement call, not a measurement.
         default: wind-diaphragm-shear
+      upstream_model:
+        description: "AI Studio model id the proxy maps the declared name to"
+        type: string
+        # Run #1 (2026-11-18) timed out at kit check's model probe; whether
+        # AI Studio serves this exact id at all is unverified. The "Probe AI
+        # Studio directly" step prints the ids this key can actually see.
+        default: gemini-3.8-flash
       rebuild:
         description: "Force a rebuild of the entry (--rebuild)"
         type: boolean
@@ -109,9 +116,10 @@ jobs:
         # websockets is importable before it starts.
         run: uv tool install harbor==0.20.0 --with websockets
 
-      # NOTE (2026-11-18): the precautionary `rm -rf` of the android/dotnet/
-      # ghc tool dirs stalled run #1 for 40+ minutes and was removed. The
-      # runner reported 87G free, which is ample for one dev task.
+      # NOTE (2026-11-18): an earlier precautionary `rm -rf` cleanup step was
+      # removed. A stale Actions page made it look stalled in run #1; it had
+      # in fact completed in 1m16s, and the runner reported 105G free after
+      # the run — ample for one dev task, so the cleanup stays out.
       - name: Report disk space
         run: df -h /
 
@@ -141,18 +149,42 @@ jobs:
           cat > kit-src/kit/model_proxy/config-aistudio.yaml <<'EOF'
           # Adapted from kit/model_proxy/config.yaml (see devrun.yml header).
           model_list:
-            - {model_name: gemini-3.8-flash, litellm_params: {model: gemini/gemini-3.8-flash, api_key: os.environ/GEMINI_API_KEY}}
+            - {model_name: gemini-3.8-flash, litellm_params: {model: gemini/${{ inputs.upstream_model }}, api_key: os.environ/GEMINI_API_KEY}}
 
           litellm_settings:
             callbacks: [effort_default.instance, judge_fallback.instance]
             drop_params: true
-            num_retries: 3
-            request_timeout: 1800
+            # Deliberate deviation from the shipped config (num_retries: 3,
+            # request_timeout: 1800): in run #1 those settings stretched a
+            # failing upstream call past kit check's 150 s probe budget, so
+            # the run recorded a bare "TimeoutError: timed out" with no HTTP
+            # status. Fail fast so the real upstream error surfaces.
+            num_retries: 0
+            request_timeout: 60
 
           general_settings:
             master_key: os.environ/MODEL_PROXY_KEY
           EOF
           cat kit-src/kit/model_proxy/config-aistudio.yaml
+
+      - name: Probe AI Studio directly (diagnostics)
+        continue-on-error: true
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        # Settles, in seconds, whether the upstream id exists for this key —
+        # run #1 instead burned kit check's whole 150 s probe budget on it.
+        # Prints model NAMES only; the key travels in a header, never a URL.
+        run: |
+          echo "== models visible to this key (names only) =="
+          curl -s --max-time 20 -H "x-goog-api-key: $GEMINI_API_KEY" \
+            "https://generativelanguage.googleapis.com/v1beta/models" \
+            | grep -o '"name": "[^"]*"' | head -60 || true
+          echo "== one minimal generateContent for ${{ inputs.upstream_model }} =="
+          curl -s --max-time 30 -w '\nHTTP %{http_code}\n' \
+            -H "x-goog-api-key: $GEMINI_API_KEY" -H 'Content-Type: application/json' \
+            -X POST "https://generativelanguage.googleapis.com/v1beta/models/${{ inputs.upstream_model }}:generateContent" \
+            -d '{"contents":[{"parts":[{"text":"Reply with the word OK."}]}]}' \
+            | head -c 2000 || true
 
       - name: Start the model proxy (AI Studio backend)
         working-directory: kit-src
@@ -185,6 +217,18 @@ jobs:
           done
           curl -s -H "Authorization: Bearer $MODEL_PROXY_KEY" \
             http://localhost:4000/v1/models | head -c 2000 || true
+
+      - name: Pre-flight chat through the proxy (host side)
+        continue-on-error: true
+        # Same request shape kit check's probe sends, but from the host: if
+        # this answers and kit check still times out, the fault is in the
+        # container -> egress -> host leg, not in LiteLLM or the upstream.
+        run: |
+          curl -s --max-time 40 -w '\nHTTP %{http_code}\n' \
+            -H "Authorization: Bearer $MODEL_PROXY_KEY" -H 'Content-Type: application/json' \
+            -X POST http://localhost:4000/v1/chat/completions \
+            -d '{"model":"gemini-3.8-flash","messages":[{"role":"user","content":"Reply with the word OK."}],"max_completion_tokens":512}' \
+            | head -c 2000 || true
 
       - name: kit check (model ping, listen, smoke, MCP, cancel)
         if: inputs.stage != 'eval'
