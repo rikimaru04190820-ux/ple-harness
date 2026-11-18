@@ -1,0 +1,264 @@
+# PLE devrun: first real-model run of the entry — `kit check`'s model stages
+# plus ONE dev-set task via eval/run.py. MANUAL ONLY (workflow_dispatch);
+# nothing here runs on push.
+#
+# Model route (BUILD-LOG.md, Claim B route 1 — the submittable one):
+# submission.yaml stays `google-cloud/gemini-3.8-flash`. A LiteLLM proxy
+# started in this job serves that name from Google AI Studio, using the
+# GEMINI_API_KEY repo secret as the upstream key. The kit only ever sees
+# MODEL_PROXY_URL / MODEL_PROXY_KEY (a dummy key generated in-job), exactly
+# as with the kit's own Vertex-backed proxy (docs/models.md lines 38-50).
+# The entry itself is untouched, so the configuration remains submittable.
+#
+# Secrets used (referenced only via the secrets context, never printed):
+#   GEMINI_API_KEY — AI Studio key, given only to the proxy process.
+#   HF_TOKEN       — read token for the gated dev-set dataset
+#                    (google/physical-engineerings-last-exam).
+#
+# UNVERIFIED until the first real run (see BUILD-LOG.md):
+# - AI Studio may not expose the model id `gemini-3.8-flash`, and its free
+#   tier rate-limits; a full task (360 min cap) may throttle or stall.
+# - Whether artifacts produced through an AI-Studio-backed proxy count as
+#   produced by the declared model is NOT documented in the kit; it stays
+#   an open question for the organizers. Treat this run's artifacts/ as
+#   experimental until that is answered.
+# - Runner size: ubuntu-latest is 4 vCPU / 16 GB, BELOW the dev-set slot
+#   sizing in eval/README.md (largest task: 6 CPU / 16.25 GB). --trials 1
+#   is forced, but a task may still run slowly or be resource-starved.
+# - Disk: hosted runners start with little free space and the kit builds
+#   several Docker images; the cleanup step below is a precaution, and a
+#   large task image could still fill the disk.
+# - The default task is `checks`-graded, so no LLM judge is called. The
+#   judge path is NOT wired for other tasks: eval/run.py would default to
+#   JUDGE_MODEL claude-opus-5-5 via this proxy, which serves only
+#   gemini-3.8-flash. Rubric / checks-judge tasks need JUDGE_* decided
+#   first — do not just change the task input to one of those.
+# - Job timeout is GitHub's 360 min maximum; a worst-case task can be cut
+#   off mid-run, and the upload steps are not guaranteed to run after a
+#   hard timeout kill.
+
+name: devrun
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "Which stages to run"
+        type: choice
+        options:
+          - both
+          - check
+          - eval
+        default: both
+      task:
+        description: "Dev task id for the eval stage (see eval/dev_set.yaml in google-research/ple)"
+        type: string
+        # checks-graded (no judge), single submission.zip deliverable, a
+        # calculation task from the self-contained "blind" family — i.e.
+        # NOT one of the 12 rubric tasks that run in the ~17 GB MCP world
+        # images. All 29 tasks share the same 360 min limit, and real task
+        # weights are not knowable without downloading the dataset, so
+        # "lightest" is a judgement call, not a measurement.
+        default: wind-diaphragm-shear
+      rebuild:
+        description: "Force a rebuild of the entry (--rebuild)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One manual run at a time: a double dispatch would double AI Studio usage.
+concurrency:
+  group: ple-devrun
+  cancel-in-progress: false
+
+jobs:
+  devrun:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Check out the entry
+        uses: actions/checkout@v4
+        with:
+          path: entry
+
+      - name: Clone the PLE kit (google-research/ple)
+        run: git clone --depth 1 https://github.com/google-research/ple.git kit-src
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the kit's dependencies in a venv
+        run: |
+          python -m venv .venv-kit
+          .venv-kit/bin/pip install \
+            "pyyaml>=6.0" "websockets>=13.0" "python-dotenv>=1.0" \
+            "huggingface-hub>=1.31,<2"
+
+      - name: Install uv (proxy launcher, eval/run.py, Harbor)
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install Harbor 0.20.0 (eval/run.py prerequisite)
+        if: inputs.stage != 'check'
+        # eval/README.md: eval/run.py checks Harbor's version and that
+        # websockets is importable before it starts.
+        run: uv tool install harbor==0.20.0 --with websockets
+
+      - name: Free disk space (precaution)
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          df -h /
+
+      - name: Generate the in-job proxy key
+        # MODEL_PROXY_KEY is the key the kit presents to OUR proxy; it is a
+        # throwaway for this job only, not a real credential. The proxy's
+        # general_settings.master_key reads it from the environment
+        # (kit/model_proxy/config.yaml), and kit check / eval/run.py read
+        # MODEL_PROXY_URL and MODEL_PROXY_KEY from the environment
+        # (docs/models.md), so exporting them here wires up every later step.
+        run: |
+          key="$(openssl rand -hex 24)"
+          echo "::add-mask::$key"
+          echo "MODEL_PROXY_KEY=$key" >> "$GITHUB_ENV"
+          echo "MODEL_PROXY_URL=http://localhost:4000" >> "$GITHUB_ENV"
+
+      - name: Write the AI Studio LiteLLM config
+        # Adapted from kit/model_proxy/config.yaml: identical shape and
+        # settings, but gemini-3.8-flash is backed by LiteLLM's Gemini
+        # (AI Studio) route instead of Vertex AI. Written INTO
+        # kit/model_proxy/ so the effort_default / judge_fallback callback
+        # modules sitting next to it resolve exactly as they do for the
+        # shipped config (the -judge suffix handling lives in those
+        # callbacks). GEMINI_API_KEY is referenced as os.environ/... so the
+        # secret itself never lands in a file.
+        run: |
+          cat > kit-src/kit/model_proxy/config-aistudio.yaml <<'EOF'
+          # Adapted from kit/model_proxy/config.yaml (see devrun.yml header).
+          model_list:
+            - {model_name: gemini-3.8-flash, litellm_params: {model: gemini/gemini-3.8-flash, api_key: os.environ/GEMINI_API_KEY}}
+
+          litellm_settings:
+            callbacks: [effort_default.instance, judge_fallback.instance]
+            drop_params: true
+            num_retries: 3
+            request_timeout: 1800
+
+          general_settings:
+            master_key: os.environ/MODEL_PROXY_KEY
+          EOF
+          cat kit-src/kit/model_proxy/config-aistudio.yaml
+
+      - name: Start the model proxy (AI Studio backend)
+        working-directory: kit-src
+        env:
+          # The only step that receives the real key: the proxy process
+          # inherits it and LiteLLM reads it via os.environ/GEMINI_API_KEY.
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        # Same launcher line as kit/model_proxy/start.sh (uv + pinned
+        # litellm), minus start.sh itself: start.sh refuses to run without
+        # VERTEXAI_PROJECT, which this route does not use. Binds 0.0.0.0
+        # like start.sh, because on Linux the kit's containers reach the
+        # host proxy via the Docker bridge / host.docker.internal rewrite
+        # (docs/models.md, eval/README.md).
+        run: |
+          nohup uv run --no-project --python 3.11 --with 'litellm[proxy,google]==1.90.0' litellm \
+            --config kit/model_proxy/config-aistudio.yaml --host 0.0.0.0 --port 4000 \
+            > "$GITHUB_WORKSPACE/litellm.log" 2>&1 &
+          echo $! > "$GITHUB_WORKSPACE/litellm.pid"
+          for i in $(seq 1 120); do
+            if curl -sf http://localhost:4000/health/liveliness > /dev/null; then
+              echo "proxy is live after ~$((i * 3))s"
+              break
+            fi
+            if [ "$i" = "120" ]; then
+              echo "proxy did not come up; log tail:"
+              tail -100 "$GITHUB_WORKSPACE/litellm.log"
+              exit 1
+            fi
+            sleep 3
+          done
+          curl -s -H "Authorization: Bearer $MODEL_PROXY_KEY" \
+            http://localhost:4000/v1/models | head -c 2000 || true
+
+      - name: kit check (model ping, listen, smoke, MCP, cancel)
+        if: inputs.stage != 'eval'
+        working-directory: kit-src
+        env:
+          # kit check's own smoke/MCP tasks are kit-internal, but the brief
+          # for this workflow is to have the token available to the stage.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        # --cancel-test is opt-in in the kit CLI; without it the cancel
+        # stage is skipped. MODEL_PROXY_URL / MODEL_PROXY_KEY come from the
+        # job environment (set above). Fail-fast: if check fails, the eval
+        # step below does not run — use stage=eval to run it on its own.
+        run: |
+          args=""
+          if [ "${{ inputs.rebuild }}" = "true" ]; then args="--rebuild"; fi
+          ../.venv-kit/bin/python -m kit check ../entry --cancel-test $args
+
+      - name: Run one dev task (eval/run.py)
+        if: inputs.stage != 'check'
+        working-directory: kit-src
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        # Downloads the task from the gated HF dataset on first use
+        # (HF_TOKEN above), runs the harness against the proxy, grades it,
+        # and exports the run's artifacts into ../entry/artifacts/ (no
+        # --no-export). --trials 1: the runner cannot hold more (header).
+        run: |
+          args=""
+          if [ "${{ inputs.rebuild }}" = "true" ]; then args="--rebuild"; fi
+          uv run python eval/run.py ../entry \
+            --tasks "${{ inputs.task }}" --trials 1 $args
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## PLE devrun"
+            echo "- stage: ${{ inputs.stage }} / task: ${{ inputs.task }} / rebuild: ${{ inputs.rebuild }}"
+            echo ""
+            echo "### entry/artifacts"
+            ls -la entry/artifacts 2>/dev/null || echo "(no artifacts produced)"
+            echo ""
+            echo "### newest eval results.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY" || true
+          import glob, json, os
+          runs = sorted(glob.glob("kit-src/runs/*/results.json"), key=os.path.getmtime)
+          if not runs:
+              print("no results.json found (eval stage did not produce one)")
+          else:
+              print("file:", runs[-1])
+              print("```json")
+              print(json.dumps(json.load(open(runs[-1])), indent=2)[:4000])
+              print("```")
+          PY
+          echo "--- litellm.log (tail) ---"
+          tail -50 litellm.log || true
+          df -h / || true
+
+      - name: Upload run outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ple-devrun-${{ inputs.task }}
+          path: |
+            entry/artifacts
+            kit-src/runs
+            litellm.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Stop the model proxy
+        if: always()
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/litellm.pid" ]; then
+            kill "$(cat "$GITHUB_WORKSPACE/litellm.pid")" || true
+          fi
